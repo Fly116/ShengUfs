@@ -143,10 +143,10 @@ IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
   bool match = false;
   if (data) {
     const char *text = static_cast<const char *> (data->getBytesNoCopy ());
-    match = text && contains (text, data->getLength (), "qcom,sm8550-ufshc");
+    match = text && (contains (text, data->getLength (), "qcom,sm8550-ufshc") || contains (text, data->getLength (), "qcom,sm8475-ufshc"));
   } else if (string) {
     const char *text = string->getCStringNoCopy ();
-    match = text && contains (text, string->getLength (), "qcom,sm8550-ufshc");
+    match = text && (contains (text, string->getLength (), "qcom,sm8550-ufshc") || contains (text, string->getLength (), "qcom,sm8475-ufshc"));
   }
   if (!match) {
     return nullptr;
@@ -187,19 +187,19 @@ static uintptr_t mapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMa
 void NativeUfs::inspect (void)
 {
   OSSharedPtr<IOMemoryMap> gccMap, memPhyMap, hcMap;
-  uintptr_t gcc = mapPhys (GCC_BASE + 0x77000, 0x1000, gccMap);
-  uintptr_t memPhy = mapPhys (GCC_BASE + 0x9e000, 0x1000, memPhyMap);
-  if (!gcc || !memPhy) {
-    panic ("NATIVE_UFS inspect: GCC map failed gcc=%p memphy=%p", (void *) gcc, (void *) memPhy);
+  uintptr_t gcc = mapPhys (UFS_CLK_PAGE_BASE, 0x1000, gccMap);
+  uintptr_t memPhy = UFS_MEM_PHY_PAGE_BASE ? mapPhys (UFS_MEM_PHY_PAGE_BASE, 0x1000, memPhyMap) : 0;
+  if (!gcc) {
+    panic ("NATIVE_UFS inspect: GCC clock page map failed gcc=%p", (void *) gcc);
   }
-  uint32_t gdsc = read32 (gcc, GCC_UFS_PHY_GDSCR - 0x77000);
-  uint32_t axi = read32 (gcc, GCC_UFS_PHY_AXI_ENABLE - 0x77000);
-  uint32_t ahb = read32 (gcc, GCC_UFS_PHY_AHB_ENABLE - 0x77000);
-  uint32_t unipro = read32 (gcc, GCC_UFS_PHY_UNIPRO_CORE_ENABLE - 0x77000);
-  uint32_t txs = read32 (gcc, GCC_UFS_PHY_TX_SYMBOL0_ENABLE - 0x77000);
-  uint32_t rxs = read32 (gcc, GCC_UFS_PHY_RX_SYMBOL0_ENABLE - 0x77000);
-  uint32_t aux = read32 (gcc, GCC_UFS_PHY_PHY_AUX_ENABLE - 0x77000);
-  uint32_t memGdsc = read32 (memPhy, 0);
+  uint32_t gdsc = read32 (gcc, GCC_UFS_PHY_GDSCR - UFS_CLK_PAGE_BASE);
+  uint32_t axi = read32 (gcc, GCC_UFS_PHY_AXI_ENABLE - UFS_CLK_PAGE_BASE);
+  uint32_t ahb = read32 (gcc, GCC_UFS_PHY_AHB_ENABLE - UFS_CLK_PAGE_BASE);
+  uint32_t unipro = read32 (gcc, GCC_UFS_PHY_UNIPRO_CORE_ENABLE - UFS_CLK_PAGE_BASE);
+  uint32_t txs = read32 (gcc, GCC_UFS_PHY_TX_SYMBOL0_ENABLE - UFS_CLK_PAGE_BASE);
+  uint32_t rxs = read32 (gcc, GCC_UFS_PHY_RX_SYMBOL0_ENABLE - UFS_CLK_PAGE_BASE);
+  uint32_t aux = read32 (gcc, GCC_UFS_PHY_PHY_AUX_ENABLE - UFS_CLK_PAGE_BASE);
+  uint32_t memGdsc = memPhy ? read32 (memPhy, 0) : 0;
   // GDSCR bit31 PWR_ON; CBCR bit31 CLK_OFF.
   bool powered = (gdsc & 0x80000000U) != 0;
   // Hardware 2026-10-17: AXI running, AHB enabled but CLK_OFF (bit31). With bit1 (HW gating)
@@ -482,7 +482,7 @@ void NativeUfs::adoptAndRead (unsigned level)
   unsigned stopLoops = 10000;
   while ((read32 (hc, 0x60) & 1) && stopLoops--) IODelay (10);
   if (read32 (hc, 0x60) & 1) panic ("NATIVE_UFS adopt: request list did not stop");
-  smmuBypassStream (0x60, smmuMap, smmuReport, phys, 16384);
+  smmuBypassStream (UFS_SMMU_STREAM_ID, smmuMap, smmuReport, phys, 16384);
   write32 (hc, 0x50, static_cast<uint32_t> (phys));
   write32 (hc, 0x54, static_cast<uint32_t> (phys >> 32));
   write32 (hc, 0x20, 0xffffffffU);  // clear stale status
@@ -1271,7 +1271,7 @@ static bool hostBringUp (const char **why)
   uint32_t report[3] = { 0, 0, 0 };
   gRootDiagnostic.stage = "SMMU and request list";
   if (!hostStopQueue (why)) return false;
-  smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, gHost.dmaBytes);
+  smmuBypassStream (UFS_SMMU_STREAM_ID, gHost.smmuMap, report, gHost.phys, gHost.dmaBytes);
   gHost.smmu = gHost.smmuMap->getVirtualAddress ();
   // The board's WiFi endpoint (wifi=2 or more) needs a pass-through stream of its own, set up here with the same code and at the same moment as the
   // storage stream: the registers of the stream matching group are not safe to touch from another thread later (a read of the first one never returned).
