@@ -94,6 +94,8 @@ public:
   void stop (IOService *provider) override;
 };
 
+extern "C" void liuqin_milestone (const char *, const char *);   // liuqin console observation
+
 OSDefineMetaClassAndStructors (NativeUfs, IOService)
 
 static uint32_t read32 (uintptr_t base, unsigned offset)
@@ -132,6 +134,7 @@ IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
     // root device, which starts before the platform expert publishes IOResources, so the
     // hardware probes run before the original AMFI (whose start panics without a PMGR).
     native_ufs_matched = 1;
+    liuqin_milestone ("U", "probe-expert");
     if (score) {
       *score = 500;
     }
@@ -152,6 +155,7 @@ IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
     return nullptr;
   }
   native_ufs_matched = 1;
+  liuqin_milestone ("U", "probe-nub");
   if (score) {
     *score = 1000;
   }
@@ -2815,6 +2819,7 @@ bool NativeUfs::start (IOService *provider)
   PE_parse_boot_argn ("native-ufs-probe", &probe, sizeof (probe));
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
   native_ufs_probe_requested = probe != 0;
+  liuqin_milestone ("U", probe ? "start-probe" : (rootMode ? "start-root" : "start-none"));
   // Default: match for observability only, never touch the controller. Hardware work runs once,
   // from the root-device personality; the ufshc nub match stays observation-only.
   if ((!probe && !rootMode) || !OSDynamicCast (IOPlatformExpertDevice, provider)) {
@@ -2824,6 +2829,7 @@ bool NativeUfs::start (IOService *provider)
   PE_parse_boot_argn ("native-ufs-diagnostics", &diagnostic, sizeof (diagnostic));
   gRootDiagnosticEnabled = diagnostic == 1;
   if (probe == 2) {
+    liuqin_milestone ("U", "inspect-begin");
     inspect ();
   }
   if (probe == 8) {
