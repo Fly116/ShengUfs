@@ -95,6 +95,23 @@ public:
 };
 
 extern "C" void liuqin_milestone (const char *, const char *);   // liuqin console observation
+extern "C" void liuqin_debug_puts (const char *);
+
+// liuqin bring-up (H11): on this board panic() text never reaches the screen — the KDB
+// wait is silent. Every panic in this file first dumps its report to the milestone
+// console, then calls the real panic so boot still halts. The helper is defined above
+// the macro on purpose: the panic() call inside it is the real one.
+static void liuqinPanicReport (const char *fmt, ...)
+{
+  char line[512];
+  __builtin_va_list va;
+  __builtin_va_start (va, fmt);
+  vsnprintf (line, sizeof line, fmt, va);
+  __builtin_va_end (va);
+  liuqin_debug_puts (line);
+  panic ("%s", line);
+}
+#define panic (...) liuqinPanicReport (__VA_ARGS__)
 
 OSDefineMetaClassAndStructors (NativeUfs, IOService)
 
