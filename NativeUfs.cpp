@@ -188,14 +188,24 @@ static uintptr_t mapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMa
   return keep ? static_cast<uintptr_t> (keep->getVirtualAddress ()) : 0;
 }
 
+extern "C" void liuqin_debug_puts (const char *);
+extern "C" int snprintf (char *, size_t, const char *, ...);
+
+// liuqin bring-up variant: every report goes to the milestone console and NOTHING
+// panics here. On this board a panic() is swallowed by the KDB wait (the photos of
+// v33c showed inspect-begin and then silence), while the console lines are the only
+// evidence that survives. The step milestones also pin down which read, if any,
+// faults.
 void NativeUfs::inspect (void)
 {
   OSSharedPtr<IOMemoryMap> gccMap, memPhyMap, hcMap;
   uintptr_t gcc = mapPhys (UFS_CLK_PAGE_BASE, 0x1000, gccMap);
   uintptr_t memPhy = UFS_MEM_PHY_PAGE_BASE ? mapPhys (UFS_MEM_PHY_PAGE_BASE, 0x1000, memPhyMap) : 0;
   if (!gcc) {
-    panic ("NATIVE_UFS inspect: GCC clock page map failed gcc=%p", (void *) gcc);
+    liuqin_debug_puts ("UFSCLK map-fail");
+    return;
   }
+  liuqin_milestone ("U", "ins-mapok");
   uint32_t gdsc = read32 (gcc, GCC_UFS_PHY_GDSCR - UFS_CLK_PAGE_BASE);
   uint32_t axi = read32 (gcc, GCC_UFS_PHY_AXI_ENABLE - UFS_CLK_PAGE_BASE);
   uint32_t ahb = read32 (gcc, GCC_UFS_PHY_AHB_ENABLE - UFS_CLK_PAGE_BASE);
@@ -204,6 +214,14 @@ void NativeUfs::inspect (void)
   uint32_t rxs = read32 (gcc, GCC_UFS_PHY_RX_SYMBOL0_ENABLE - UFS_CLK_PAGE_BASE);
   uint32_t aux = read32 (gcc, GCC_UFS_PHY_PHY_AUX_ENABLE - UFS_CLK_PAGE_BASE);
   uint32_t memGdsc = memPhy ? read32 (memPhy, 0) : 0;
+  liuqin_milestone ("U", "ins-clk");
+  {
+    char line[160];
+    snprintf (line, sizeof line, "UFSCLK gdsc=%08x axi=%08x ahb=%08x unipro=%08x", gdsc, axi, ahb, unipro);
+    liuqin_debug_puts (line);
+    snprintf (line, sizeof line, "UFSCLK tx=%08x rx=%08x aux=%08x memgdsc=%08x", txs, rxs, aux, memGdsc);
+    liuqin_debug_puts (line);
+  }
   // GDSCR bit31 PWR_ON; CBCR bit31 CLK_OFF.
   bool powered = (gdsc & 0x80000000U) != 0;
   // Hardware 2026-10-17: AXI running, AHB enabled but CLK_OFF (bit31). With bit1 (HW gating)
@@ -223,13 +241,14 @@ void NativeUfs::inspect (void)
       readHc = 1;
     }
   }
-  panic ("NATIVE_UFS inspect\n"
-         "gdsc=%08x memphygdsc=%08x\n"
-         "axi=%08x ahb=%08x unipro=%08x\n"
-         "txsym=%08x rxsym=%08x aux=%08x\n"
-         "hc_read=%u cap=%08x ver=%08x\n"
-         "is=%08x hcs=%08x hce=%08x utrlba=%08x",
-         gdsc, memGdsc, axi, ahb, unipro, txs, rxs, aux, readHc, cap, ver, is, hcs, hce, utrlba);
+  liuqin_milestone ("U", "ins-hc");
+  {
+    char line[160];
+    snprintf (line, sizeof line, "UFSHC rd=%u cap=%08x ver=%08x is=%08x", readHc, cap, ver, is);
+    liuqin_debug_puts (line);
+    snprintf (line, sizeof line, "UFSHC hcs=%08x hce=%08x utrlba=%08x", hcs, hce, utrlba);
+    liuqin_debug_puts (line);
+  }
 }
 
 // Adopt the controller the firmware left running (native-ufs-probe=3) and issue
