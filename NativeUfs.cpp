@@ -2442,10 +2442,16 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     void lock () {}     // the request's own bounce buffer holds its snapshot
     void unlock () {}
     IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
       uint64_t t0 = timerTicks ();
       IOReturn r = hostRead4k (0, lba, blocks, out);
       __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
       return r;
+#else
+      // liuqin fork fix: the verified-block timing declarations above only exist when
+      // NATIVE_VERIFIED_BLOCK is on; upstream never compiled this path. Plain transport.
+      return hostRead4k (0, lba, blocks, out);
+#endif
     }
     IOReturn verify (uint64_t index, const void *data, size_t length) {
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
