@@ -179,7 +179,12 @@ bool NativeUfs::waitSet (uintptr_t base, unsigned offset, uint32_t mask, unsigne
 // GDSC is powered and the AXI/AHB branches are running; nothing is written.
 static uintptr_t mapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMap> &keep)
 {
-  IODeviceMemory *memory = IODeviceMemory::withRange (phys, length);
+  // liuqin fork fix (v33e): IODeviceMemory::withRange consults the platform device-memory
+  // range set, which the Qualcomm firmware/ADT never publishes; the call did not return on
+  // hardware (v33c/v33d screens froze between inspect-begin and ins-mapok). Use the same
+  // physical-address descriptor as UniXNU-mondrian's mapPhysical on the same SM8475 SoC.
+  IOMemoryDescriptor *memory =
+      IOMemoryDescriptor::withPhysicalAddress (phys, length, kIODirectionInOut);
   if (!memory) {
     return 0;
   }
@@ -199,7 +204,9 @@ extern "C" int snprintf (char *, size_t, const char *, ...);
 void NativeUfs::inspect (void)
 {
   OSSharedPtr<IOMemoryMap> gccMap, memPhyMap, hcMap;
+  liuqin_debug_puts ("UFSCLK map-begin");
   uintptr_t gcc = mapPhys (UFS_CLK_PAGE_BASE, 0x1000, gccMap);
+  liuqin_debug_puts (gcc ? "UFSCLK map-done" : "UFSCLK map-null");
   uintptr_t memPhy = UFS_MEM_PHY_PAGE_BASE ? mapPhys (UFS_MEM_PHY_PAGE_BASE, 0x1000, memPhyMap) : 0;
   if (!gcc) {
     liuqin_debug_puts ("UFSCLK map-fail");
