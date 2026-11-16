@@ -67,6 +67,17 @@ volatile uint32_t native_ufs_mapped = 0;
 volatile uint32_t native_ufs_status = 0;
 // Root start: 1 entered, 2 host up, 3 layout found; the last soft-failure reason (a static string), for the boot page.
 volatile uint32_t native_ufs_root_step = 0;
+// liuqin (H13): the boot defconfig builds this transport with NATIVE_VERIFIED_BLOCK=0
+// (the VerifiedRoot policy chain is not ported to the Linux build host yet), so no signed
+// volume identity exists. Upstream then refuses root publication unconditionally; on this
+// board that made native-ufs-root=1 a guaranteed dead end. The bypass opens only with the
+// explicit boot arg native-ufs-unauth-root=1 and is recorded here for the console report.
+volatile uint32_t native_ufs_unauth_root = 0;
+static bool rootUnauthGateOpen ()
+{
+  unsigned unauth = 0;
+  return PE_parse_boot_argn ("native-ufs-unauth-root", &unauth, sizeof (unauth)) && unauth == 1;
+}
 const char *volatile native_ufs_root_failure = nullptr;
 volatile uint32_t native_ufs_cap = 0;
 volatile uint32_t native_ufs_version = 0;
@@ -2694,6 +2705,33 @@ static bool mediaWithUuidExists (const char *uuid, NativeUfsBlock *window)
   return found;
 }
 
+// liuqin (H13) unauthenticated mode: no signed volume UUID to wait for, so the gate
+// relaxes to "any IOMedia whose service-plane ancestors reach this window" (the generic
+// IOBlockStorageDriver personality claimed the device and published its media).
+static bool mediaUnderWindowExists (NativeUfsBlock *window)
+{
+  OSDictionary *matching = IOService::serviceMatching ("IOMedia");
+  bool found = false;
+  if (matching) {
+    OSIterator *iterator = IOService::getMatchingServices (matching);
+    if (iterator) {
+      for (unsigned matches = 0; matches < 64 && !found; ++matches) {
+        IORegistryEntry *media = OSDynamicCast (IORegistryEntry, iterator->getNextObject ());
+        if (!media) break;
+        IORegistryIterator *parents = IORegistryIterator::iterateOver (
+          media, gIOServicePlane, kIORegistryIterateRecursively | kIORegistryIterateParents);
+        if (parents) {
+          found = ufsMediaHasAncestor (*parents, window);
+          parents->release ();
+        }
+      }
+      iterator->release ();
+    }
+    OSSafeReleaseNULL (matching);
+  }
+  return found;
+}
+
 // What sits below the window in the service plane, matched or not (getMatchingServices lists only services whose matching has
 // finished, so media held up in matching would not show): each entry's class, BSD name, busy count and whether its matching is done.
 static void captureMissingMedia (const char *uuid, IOService *window)
@@ -2734,8 +2772,16 @@ static void publishThread (void *, wait_result_t)
       gRootDiagnostic.stage = "root window service start";
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Start);
       gRootDiagnostic.publicationWindow = index;
-      if (!device->start (gPendingProvider)) return false;
+      if (!device->start (gPendingProvider)) {
+        liuqin_milestone ("U", "root-winstart-fail");
+        return false;
+      }
       native_ufs_blocks_published = native_ufs_blocks_published + 1;
+      {
+        static char marker[40];   // one publisher thread at a time; buffer reused, contents copied by the sink
+        snprintf (marker, sizeof marker, "root-pub-%.8s", device->windowLabel ());
+        liuqin_milestone ("U", marker);
+      }
       IOLog ("NativeUfs: published %s\n", device->windowLabel ());
       return true;
     }
@@ -2746,22 +2792,29 @@ static void publishThread (void *, wait_result_t)
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Media);
       gRootDiagnostic.publicationWindow = index;
       bool ready = false;
+      const bool unauth = native_ufs_unauth_root != 0;   // liuqin H13: identity gate was bypassed
+      const char *shown = unauth ? "(unauth media)" : uuid;
       // Diagnostic mode affects reporting only, never the dependency gate.
       for (unsigned tick = 0; tick <= 300; ++tick) {
-        ready = mediaWithUuidExists (uuid, device);
+        ready = unauth ? mediaUnderWindowExists (device) : mediaWithUuidExists (uuid, device);
         if (ready || tick == 300) break;
         if (tick && tick % 50 == 0) {
           // Every 5 s: what the IOKit side has published so far, and whether the window's own matching is still busy.
           captureMissingMedia (uuid, device);
-          IOLog ("NativeUfs: %s volume %s still missing after %u s, window busy %u\n%s", device->windowLabel (), uuid,
+          IOLog ("NativeUfs: %s volume %s still missing after %u s, window busy %u\n%s", device->windowLabel (), shown,
                  tick / 10, device->getBusyState (), gRootMediaText);
         }
         IOSleep (100);
       }
-      IOLog ("NativeUfs: %s volume %s %s\n", device->windowLabel (), uuid, ready ? "ready" : "not ready");
+      IOLog ("NativeUfs: %s volume %s %s\n", device->windowLabel (), shown, ready ? "ready" : "not ready");
       if (!ready) {
         captureMissingMedia (uuid, device);
         IOLog ("NativeUfs: media at timeout, window busy %u\n%s", device->getBusyState (), gRootMediaText);
+        liuqin_milestone ("U", "root-media-timeout");
+      } else {
+        static char marker[40];   // one publisher thread at a time
+        snprintf (marker, sizeof marker, "root-media-%.8s", device->windowLabel ());
+        liuqin_milestone ("U", marker);
       }
       return ready;
     }
@@ -2772,7 +2825,8 @@ static void publishThread (void *, wait_result_t)
     gRootDiagnostic.result = result.phase == UfsRootPhase::Start ? kIOReturnIOError : kIOReturnTimeout;
     const char *reason = result.phase == UfsRootPhase::Start ? "root window service start failed" :
       (!strcmp (gPendingDevice[result.index]->windowLabel (), "SystemOS") ?
-       "SystemOS signed volume not found" : "signed root window volume not found");
+       (native_ufs_unauth_root ? "SystemOS window media not found" : "SystemOS signed volume not found")
+                            : (native_ufs_unauth_root ? "root window media not found" : "signed root window volume not found"));
     IOLog ("NativeUfs: root publisher stopped at window %u; published=%u\n", result.index, result.published);
     // Start failures have already released their unpublished object; do not
     // dereference it here. The media-failure object is deliberately retained.
@@ -2984,18 +3038,22 @@ bool NativeUfs::startRoot (IOService *provider)
   const char *why = "";
   native_ufs_root_step = 1;
   if (!hostBringUp (&why)) {
+    liuqin_milestone ("U", "root-bringup-fail");
     rootDiagnosticFailure (why);
     IOLog ("NativeUfs: root bring-up failed: %s\n", why);
     return false;
   }
+  liuqin_milestone ("U", "root-bringup-ok");
   native_ufs_root_step = 2;
   RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
   if (!layout || !findRootLayout (layout, &why)) {
+    liuqin_milestone ("U", "root-layout-fail");
     rootDiagnosticFailure (layout ? why : "root layout allocation failed");
     IOLog ("NativeUfs: root layout failed: %s\n", why);
     if (layout) IOFree (layout, sizeof (RootLayout));
     return false;
   }
+  liuqin_milestone ("U", "root-layout-ok");
   native_ufs_root_step = 3;
   if (layout->manifestStatus != 0) {
     rootDiagnosticFailure ("root manifest rejected");
@@ -3009,18 +3067,23 @@ bool NativeUfs::startRoot (IOService *provider)
   gRootObjects = layout->objects;
   for (unsigned i = 0; i < layout->objects; ++i) gRootObject[i] = layout->object[i];
   gRootObjectBase = layout->userdataFirst * 4096ULL;
+  liuqin_milestone ("U", "root-manifest-ok");
   const char *names[4] = {};
   for (unsigned i = 0; i < layout->windows; ++i) names[i] = layout->window[i].name;
   if (!ufsBuildRootPlan (names, layout->windows, gPublicationPlan)) {
+    liuqin_milestone ("U", "root-plan-fail");
     rootDiagnosticFailure ("root windows require distinct OS and SystemOS");
     IOFree (layout, sizeof (RootLayout));
     return false;
   }
+  liuqin_milestone ("U", "root-plan-ok");
   if (!IOService::start (provider)) {
+    liuqin_milestone ("U", "root-iostart-fail");
     rootDiagnosticFailure ("root IOService start failed");
     IOFree (layout, sizeof (RootLayout));
     return false;
   }
+  liuqin_milestone ("U", "root-iostart-ok");
   // Prepare all windows or publish none. Diagnostics never decide policy.
   gPending = 0;
   gPendingProvider = this;
@@ -3057,6 +3120,16 @@ bool NativeUfs::startRoot (IOService *provider)
       }
       return true;
 #else
+      // liuqin (H13): no signed identities exist in the unverified bring-up build;
+      // upstream fails closed here in every case. native-ufs-unauth-root=1 opens the
+      // gate on purpose (bring-up instrument only, never for a release profile).
+      if (rootUnauthGateOpen ()) {
+        native_ufs_unauth_root = 1;
+        gRootDiagnostic.stage = "root identity gate: unauth";
+        liuqin_milestone ("U", "root-unauth-open");
+        IOLog ("NativeUfs: root identity gate bypassed by native-ufs-unauth-root=1\n");
+        return true;
+      }
       return false; // Root publication requires owner verification in every build.
 #endif
     }
@@ -3077,6 +3150,11 @@ bool NativeUfs::startRoot (IOService *provider)
   } operations = { this, layout };
   UfsRootPublicationResult result = ufsPrepareRootWindows (operations, layout->windows);
   IOFree (layout, sizeof (RootLayout));
+  if (result.phase == UfsRootPhase::Complete) {
+    liuqin_milestone ("U", "root-prepared");
+  } else {
+    liuqin_milestone ("U", "root-prepare-fail");
+  }
   if (result.phase != UfsRootPhase::Complete) {
     gPending = 0;
     gRootDiagnostic.result = result.phase == UfsRootPhase::Identity ? kIOReturnNotPrivileged :
