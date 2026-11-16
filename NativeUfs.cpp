@@ -101,7 +101,8 @@ extern "C" void liuqin_debug_puts (const char *);
 // wait is silent. Every panic in this file first dumps its report to the milestone
 // console, then calls the real panic so boot still halts. The helper is defined above
 // the macro on purpose: the panic() call inside it is the real one.
-static void liuqinPanicReport (const char *fmt, ...)
+__attribute__((noreturn, format(printf, 1, 2)))
+static void lqPanic (const char *fmt, ...)
 {
   char line[512];
   __builtin_va_list va;
@@ -109,9 +110,9 @@ static void liuqinPanicReport (const char *fmt, ...)
   vsnprintf (line, sizeof line, fmt, va);
   __builtin_va_end (va);
   liuqin_debug_puts (line);
-  panic ("%s", line);
+  panic ("%s", line);   // the real panic: halts; the text is already on screen
+  while (true) {}
 }
-#define panic (...) liuqinPanicReport (__VA_ARGS__)
 
 OSDefineMetaClassAndStructors (NativeUfs, IOService)
 
@@ -445,7 +446,7 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
 {
   uintptr_t smmu = mapPhys (0x15000000ULL, 0xd0000, keep);
   if (!smmu) {
-    panic ("NATIVE_UFS smmu: map failed");
+    lqPanic ("NATIVE_UFS smmu: map failed");
   }
   UfsSmmuPlan plan = planUfsSmmu (stream, dma, bytes, [smmu](unsigned offset) { return read32 (smmu, offset); });
   gRootDiagnostic.smmuId1 = read32 (smmu, 0x24);
@@ -456,7 +457,7 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
     gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnNotReady);
     gRootDiagnostic.smr = plan.smr; gRootDiagnostic.s2cr = plan.s2cr;
     rootDiagnosticFailure (plan.error);
-    panic ("NATIVE_UFS smmu: %s slot=%u smr=%x s2cr=%x", plan.error, plan.slot, plan.smr, plan.s2cr);
+    lqPanic ("NATIVE_UFS smmu: %s slot=%u smr=%x s2cr=%x", plan.error, plan.slot, plan.smr, plan.s2cr);
   }
   unsigned bank = plan.bank, index = plan.slot;
   uintptr_t cb = smmu + (plan.pages + bank) * 4096;
@@ -476,7 +477,7 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
     gRootDiagnostic.stage = "SMMU readback";
     gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnNotReady);
     rootDiagnosticFailure (failure);
-    panic ("NATIVE_UFS smmu: %s idx=%u bank=%u cba2r=%x", failure, index, bank,
+    lqPanic ("NATIVE_UFS smmu: %s idx=%u bank=%u cba2r=%x", failure, index, bank,
            gRootDiagnostic.cba2r);
   }
   report[0] = index | (bank << 16);
@@ -489,7 +490,7 @@ void NativeUfs::adoptAndRead (unsigned level)
   OSSharedPtr<IOMemoryMap> hcMap;
   uintptr_t hc = mapPhys (UFS_HC_BASE, UFS_HC_SIZE, hcMap);
   if (!hc) {
-    panic ("NATIVE_UFS adopt: controller map failed");
+    lqPanic ("NATIVE_UFS adopt: controller map failed");
   }
   // The controller's own request list is the one region its DMA is known to reach
   // (hardware 2026-10-17: a kernel-allocated buffer at 0xf080f000 reset the system when the
@@ -498,7 +499,7 @@ void NativeUfs::adoptAndRead (unsigned level)
   // dma-coherent). Test instrument only: the kernel may also own these pages.
   uint64_t fwList = (uint64_t (read32 (hc, 0x54)) << 32) | read32 (hc, 0x50);
   if (!fwList || (fwList & 0xfff)) {
-    panic ("NATIVE_UFS adopt: no usable firmware list base=%llx", fwList);
+    lqPanic ("NATIVE_UFS adopt: no usable firmware list base=%llx", fwList);
   }
   IOMemoryDescriptor *region = IOMemoryDescriptor::withPhysicalAddress (fwList, 16384, kIODirectionInOut);
   OSSharedPtr<IOMemoryMap> regionMap;
@@ -507,7 +508,7 @@ void NativeUfs::adoptAndRead (unsigned level)
     region->release ();
   }
   if (!regionMap) {
-    panic ("NATIVE_UFS adopt: firmware list map failed base=%llx", fwList);
+    lqPanic ("NATIVE_UFS adopt: firmware list map failed base=%llx", fwList);
   }
   uint8_t *virt = reinterpret_cast<uint8_t *> (regionMap->getVirtualAddress ());
   uint64_t phys = fwList;
@@ -519,7 +520,7 @@ void NativeUfs::adoptAndRead (unsigned level)
   uint32_t hcsBefore = read32 (hc, 0x30);
   uint32_t doorbellBefore = read32 (hc, 0x58);
   if (doorbellBefore != 0 || read32 (hc, 0x78) != 0) {
-    panic ("NATIVE_UFS adopt: firmware request outstanding doorbell=%08x hcs=%08x", doorbellBefore, hcsBefore);
+    lqPanic ("NATIVE_UFS adopt: firmware request outstanding doorbell=%08x hcs=%08x", doorbellBefore, hcsBefore);
   }
   OSSharedPtr<IOMemoryMap> smmuMap;
   uint32_t smmuReport[3] = { 0, 0, 0 };
@@ -528,17 +529,17 @@ void NativeUfs::adoptAndRead (unsigned level)
   __asm__ volatile ("dsb sy" ::: "memory");
   unsigned stopLoops = 10000;
   while ((read32 (hc, 0x60) & 1) && stopLoops--) IODelay (10);
-  if (read32 (hc, 0x60) & 1) panic ("NATIVE_UFS adopt: request list did not stop");
+  if (read32 (hc, 0x60) & 1) lqPanic ("NATIVE_UFS adopt: request list did not stop");
   smmuBypassStream (UFS_SMMU_STREAM_ID, smmuMap, smmuReport, phys, 16384);
   write32 (hc, 0x50, static_cast<uint32_t> (phys));
   write32 (hc, 0x54, static_cast<uint32_t> (phys >> 32));
   write32 (hc, 0x20, 0xffffffffU);  // clear stale status
   write32 (hc, 0x60, 1);
   if (!waitSet (hc, 0x30, 0x2, 100000)) {
-    panic ("NATIVE_UFS adopt: request list not ready hcs=%08x", read32 (hc, 0x30));
+    lqPanic ("NATIVE_UFS adopt: request list not ready hcs=%08x", read32 (hc, 0x30));
   }
   if (level == 3) {
-    panic ("NATIVE_UFS adopt: list replaced\n"
+    lqPanic ("NATIVE_UFS adopt: list replaced\n"
            "phys=%llx hcs=%08x->%08x\n"
            "is=%08x db=%08x rsr=%08x ba=%08x bau=%08x ie=%08x",
            phys, hcsBefore, read32 (hc, 0x30), read32 (hc, 0x20), read32 (hc, 0x58),
@@ -668,7 +669,7 @@ void NativeUfs::adoptAndRead (unsigned level)
     uint8_t tur0[6] = { 0, 0, 0, 0, 0, 0 };
     UfsResult t = command (0, tur0, 6, false, 0);
     const uint8_t *rsp0 = virt + ucdOffset + rspOffset;
-    panic ("NATIVE_UFS adopt: TEST UNIT READY lun0\n"
+    lqPanic ("NATIVE_UFS adopt: TEST UNIT READY lun0\n"
            "ocs=%x resp=%02x scsi=%02x\n"
            "phys=%llx hcs=%08x->%08x smmu idx/bank=%08x cbar=%08x\n"
            "is=%08x db=%08x rsr=%08x\n"
@@ -688,7 +689,7 @@ void NativeUfs::adoptAndRead (unsigned level)
       if (lun == 0 && attempt == 0 && r.ocs == 0xf) {
         // Never completed: stop here and report instead of waiting out every command.
         const uint8_t *rsp = virt + ucdOffset + rspOffset;
-        panic ("NATIVE_UFS adopt: first command did not complete\n"
+        lqPanic ("NATIVE_UFS adopt: first command did not complete\n"
                "phys=%llx hcs=%08x->%08x\n"
                "is=%08x db=%08x rsr=%08x ba=%08x\n"
                "utrd2=%08x rsp=%08x %08x",
@@ -713,12 +714,12 @@ void NativeUfs::adoptAndRead (unsigned level)
     // Read-only GPT survey of LUN 0 (4096-byte blocks): header fields and CRCs for before/after
     // comparison, then every non-empty entry among the first 64. Nothing is written.
     if (blockSize[0] != 4096) {
-      panic ("NATIVE_UFS gpt: unexpected LUN0 block size %08x", blockSize[0]);
+      lqPanic ("NATIVE_UFS gpt: unexpected LUN0 block size %08x", blockSize[0]);
     }
     uint8_t rd[10] = { 0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0 };
     UfsResult h = command (0, rd, 10, true, 4096);
     if (h.ocs != 0 || h.scsi != 0) {
-      panic ("NATIVE_UFS gpt: header read failed ocs=%x resp=%x scsi=%x", h.ocs, h.response, h.scsi);
+      lqPanic ("NATIVE_UFS gpt: header read failed ocs=%x resp=%x scsi=%x", h.ocs, h.response, h.scsi);
     }
     const uint8_t *hdr = virt + dataOffset;
     auto le32 = [] (const uint8_t *at) -> uint32_t {
@@ -733,14 +734,14 @@ void NativeUfs::adoptAndRead (unsigned level)
     uint32_t entCount = le32 (hdr + 80), entSize = le32 (hdr + 84);
     uint32_t guid0 = le32 (hdr + 56), guid1 = le32 (hdr + 60), guid2 = le32 (hdr + 64), guid3 = le32 (hdr + 68);
     if (sig0 != 0x20494645U || sig1 != 0x54524150U || entSize != 128 || entLba > 64) {
-      panic ("NATIVE_UFS gpt: unexpected header sig=%08x %08x esz=%u elba=%llx", sig0, sig1, entSize, entLba);
+      lqPanic ("NATIVE_UFS gpt: unexpected header sig=%08x %08x esz=%u elba=%llx", sig0, sig1, entSize, entLba);
     }
     uint32_t shown = entCount > 64 ? 64 : entCount;
     uint32_t blocks = (shown * 128 + 4095) / 4096;
     uint8_t rd2[10] = { 0x28, 0, 0, 0, 0, uint8_t (entLba), 0, 0, uint8_t (blocks), 0 };
     UfsResult e = command (0, rd2, 10, true, blocks * 4096);
     if (e.ocs != 0 || e.scsi != 0) {
-      panic ("NATIVE_UFS gpt: entries read failed ocs=%x scsi=%x", e.ocs, e.scsi);
+      lqPanic ("NATIVE_UFS gpt: entries read failed ocs=%x scsi=%x", e.ocs, e.scsi);
     }
     const uint8_t *ents = virt + dataOffset;
     static char text[3400];
@@ -772,7 +773,7 @@ void NativeUfs::adoptAndRead (unsigned level)
       listed++;
     }
     snprintf (text + used, sizeof (text) - used, "\nlisted=%u", listed);
-    panic ("%s", text);
+    lqPanic ("%s", text);
   }
   // INQUIRY of LUN 0: vendor/product bytes 8..23.
   uint8_t inquiry[6] = { 0x12, 0, 0, 0, 36, 0 };
@@ -793,7 +794,7 @@ void NativeUfs::adoptAndRead (unsigned level)
     }
   }
   hcsAfter = read32 (hc, 0x30);
-  panic ("NATIVE_UFS adopt+read\n"
+  lqPanic ("NATIVE_UFS adopt+read\n"
          "hcs %08x->%08x pwr %08x->%08x ssu=%06x\n"
          "L0 st=%06x last=%08x bs=%08x sns=%06x\n"
          "L1 st=%06x last=%08x bs=%08x sns=%06x\n"
@@ -832,18 +833,18 @@ void NativeUfs::dumpFirmwareList (void)
   OSSharedPtr<IOMemoryMap> hcMap, listMap, ucdMap;
   uintptr_t hc = mapPhys (UFS_HC_BASE, UFS_HC_SIZE, hcMap);
   if (!hc) {
-    panic ("NATIVE_UFS dump: controller map failed");
+    lqPanic ("NATIVE_UFS dump: controller map failed");
   }
   uint64_t listPhys = (uint64_t (read32 (hc, 0x54)) << 32) | read32 (hc, 0x50);
   uint32_t db = read32 (hc, 0x58), rsr = read32 (hc, 0x60), hcs = read32 (hc, 0x30);
   IOMemoryDescriptor *listDesc = IOMemoryDescriptor::withPhysicalAddress (listPhys, 4096, kIODirectionIn);
   if (!listDesc) {
-    panic ("NATIVE_UFS dump: list descriptor failed phys=%llx", listPhys);
+    lqPanic ("NATIVE_UFS dump: list descriptor failed phys=%llx", listPhys);
   }
   listMap = OSSharedPtr<IOMemoryMap> (listDesc->map (kIOMapAnywhere), OSNoRetain);
   listDesc->release ();
   if (!listMap) {
-    panic ("NATIVE_UFS dump: list map failed phys=%llx", listPhys);
+    lqPanic ("NATIVE_UFS dump: list map failed phys=%llx", listPhys);
   }
   const volatile uint32_t *utrd = reinterpret_cast<const volatile uint32_t *> (listMap->getVirtualAddress ());
   uint64_t ucdPhys = (uint64_t (dumpWord (utrd, 5)) << 32) | dumpWord (utrd, 4);
@@ -859,7 +860,7 @@ void NativeUfs::dumpFirmwareList (void)
       }
     }
   }
-  panic ("NATIVE_UFS dump: firmware list\n"
+  lqPanic ("NATIVE_UFS dump: firmware list\n"
          "list=%llx hcs=%08x db=%08x rsr=%08x\n"
          "utrd0 %08x %08x %08x %08x\n"
          "utrd0 %08x %08x %08x %08x\n"
@@ -880,7 +881,7 @@ void NativeUfs::inspectSmmu (void)
   OSSharedPtr<IOMemoryMap> map;
   uintptr_t smmu = mapPhys (0x15000000ULL, 0x1000, map);
   if (!smmu) {
-    panic ("NATIVE_UFS smmu: map failed");
+    lqPanic ("NATIVE_UFS smmu: map failed");
   }
   uint32_t scr0 = read32 (smmu, 0x00), idr0 = read32 (smmu, 0x20), idr1 = read32 (smmu, 0x24);
   uint32_t gfsr = read32 (smmu, 0x48);
@@ -904,7 +905,7 @@ void NativeUfs::inspectSmmu (void)
       }
     }
   }
-  panic ("NATIVE_UFS smmu\n"
+  lqPanic ("NATIVE_UFS smmu\n"
          "scr0=%08x idr0=%08x idr1=%08x gfsr=%08x\n"
          "nsmr=%u valid=%u types t0=%u t1=%u t2=%u\n"
          "sid0x60 match=%x smr=%08x s2cr=%08x",
@@ -919,13 +920,13 @@ void NativeUfs::inspectContextBanks (void)
   OSSharedPtr<IOMemoryMap> map;
   uintptr_t smmu = mapPhys (0x15000000ULL, 0xd0000, map);
   if (!smmu) {
-    panic ("NATIVE_UFS cb: map failed");
+    lqPanic ("NATIVE_UFS cb: map failed");
   }
   uint32_t idr1 = read32 (smmu, 0x24);
   unsigned numCb = idr1 & 0xff;
   unsigned globalPages = 1U << (((idr1 >> 28) & 7) + 1);
   if (globalPages > 128 || numCb > 128 || (globalPages + numCb) * 0x1000 > 0xd0000) {
-    panic ("NATIVE_UFS cb: unexpected geometry idr1=%08x", idr1);
+    lqPanic ("NATIVE_UFS cb: unexpected geometry idr1=%08x", idr1);
   }
   unsigned cbarZero = 0, sctlrZero = 0, mSet = 0, bothZero = 0;
   uint32_t firstZero = 0xffff;
@@ -943,7 +944,7 @@ void NativeUfs::inspectContextBanks (void)
     }
   }
   uintptr_t cb0 = smmu + globalPages * 0x1000, cb1 = cb0 + 0x1000, cbLast = cb0 + (numCb - 1) * 0x1000;
-  panic ("NATIVE_UFS cb survey\n"
+  lqPanic ("NATIVE_UFS cb survey\n"
          "ncb=%u pages=%u cbar0=%u sctlr0=%u msset=%u both0=%u first0=%x\n"
          "cbar[0]=%08x cbar[1]=%08x cbar[%u]=%08x\n"
          "sctlr[0]=%08x sctlr[1]=%08x sctlr[last]=%08x\n"
@@ -2051,7 +2052,7 @@ static void rootDiagnosticFailure (const char *reason)
   gRootDiagnostic.failures = native_ufs_block_failures;
   formatUfsRootDiagnostics (gRootDiagnosticText, sizeof (gRootDiagnosticText), gRootDiagnostic, reason);
   strlcat (gRootDiagnosticText, gRootMediaText, sizeof (gRootDiagnosticText));
-  panic ("%s", gRootDiagnosticText);
+  lqPanic ("%s", gRootDiagnosticText);
 }
 
 bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint64_t size)
@@ -2794,7 +2795,7 @@ static void statsThread (void *argument, wait_result_t)
 {
   unsigned delay = static_cast<unsigned> (reinterpret_cast<uintptr_t> (argument));
   IOSleep (delay * 1000);
-  panic ("NATIVE_UFS memory snapshot after %u s\n"
+  lqPanic ("NATIVE_UFS memory snapshot after %u s\n"
          "pages total=%u free=%u active=%u inactive=%u wired=%u spec=%u purgeable=%u\n"
          "available=%u max_mem=%llx procs=%d blocks=%llu\n",
          delay, vm_page_pages, vm_page_free_count, vm_page_active_count, vm_page_inactive_count,
@@ -2853,7 +2854,7 @@ static void mediaReportThread (void *, wait_result_t)
   if (matching) {
     matching->release ();
   }
-  panic ("%s", gMediaReport);
+  lqPanic ("%s", gMediaReport);
 }
 
 bool NativeUfs::start (IOService *provider)
@@ -2891,13 +2892,13 @@ bool NativeUfs::start (IOService *provider)
     // Read-only check before anything is flashed: LUN 0 GPT -> "userdata" -> its first block.
     const char *why = "";
     if (!hostBringUp (&why)) {
-      panic ("NATIVE_UFS root check: bring-up failed: %s", why);
+      lqPanic ("NATIVE_UFS root check: bring-up failed: %s", why);
     }
     RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
     if (!layout || !findRootLayout (layout, &why)) {
-      panic ("NATIVE_UFS root check: %s", why);
+      lqPanic ("NATIVE_UFS root check: %s", why);
     }
-    panic ("NATIVE_UFS root check\n"
+    lqPanic ("NATIVE_UFS root check\n"
            "userdata first=%llx last=%llx\n"
            "block0 magic %08x %08x ext4magic=%04x ext4blocks=%u\n"
            "manifest status=%u windows=%u",
@@ -2909,11 +2910,11 @@ bool NativeUfs::start (IOService *provider)
     // attached dmg disk image carries "EFI PART"). Read-only.
     const char *why = "";
     if (!hostBringUp (&why)) {
-      panic ("NATIVE_UFS root windows: bring-up failed: %s", why);
+      lqPanic ("NATIVE_UFS root windows: bring-up failed: %s", why);
     }
     RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
     if (!layout || !findRootLayout (layout, &why)) {
-      panic ("NATIVE_UFS root windows: %s", why);
+      lqPanic ("NATIVE_UFS root windows: %s", why);
     }
     uint32_t sig[4][2] = {};
     uint32_t seen[4] = {};
@@ -2925,7 +2926,7 @@ bool NativeUfs::start (IOService *provider)
         sig[index][1] = le32 (gScratch + 516);
       }
     }
-    panic ("NATIVE_UFS root windows\n"
+    lqPanic ("NATIVE_UFS root windows\n"
            "userdata first=%llx last=%llx manifest status=%u windows=%u\n"
            "w0 %s off=%llx size=%llx gpt=%08x %08x read=%u\n"
            "w1 %s off=%llx size=%llx gpt=%08x %08x read=%u\n"
@@ -2939,7 +2940,7 @@ bool NativeUfs::start (IOService *provider)
   }
   if (probe == 14) {
     // Immediate memory snapshot at root-device start, before the userspace that triggers jetsam.
-    panic ("NATIVE_UFS early memory snapshot\n"
+    lqPanic ("NATIVE_UFS early memory snapshot\n"
            "pages total=%u free=%u active=%u inactive=%u wired=%u spec=%u purgeable=%u\n"
            "available=%u max_mem=%llx procs=%d",
            vm_page_pages, vm_page_free_count, vm_page_active_count, vm_page_inactive_count,
@@ -2950,11 +2951,11 @@ bool NativeUfs::start (IOService *provider)
     unsigned delay = 12;
     PE_parse_boot_argn ("native-ufs-stats-delay", &delay, sizeof (delay));
     if (!startRoot (provider)) {
-      panic ("NATIVE_UFS memory snapshot: root start failed");
+      lqPanic ("NATIVE_UFS memory snapshot: root start failed");
     }
     thread_t thread = nullptr;
     if (kernel_thread_start (statsThread, reinterpret_cast<void *> (static_cast<uintptr_t> (delay)), &thread) != KERN_SUCCESS) {
-      panic ("NATIVE_UFS memory snapshot: cannot start the thread");
+      lqPanic ("NATIVE_UFS memory snapshot: cannot start the thread");
     }
     thread_deallocate (thread);
     return true;
@@ -2962,11 +2963,11 @@ bool NativeUfs::start (IOService *provider)
   if (probe == 12) {
     bool published = startRoot (provider);
     if (!published) {
-      panic ("NATIVE_UFS media report: root start failed (blocks=%u)", native_ufs_blocks_published);
+      lqPanic ("NATIVE_UFS media report: root start failed (blocks=%u)", native_ufs_blocks_published);
     }
     thread_t thread = nullptr;
     if (kernel_thread_start (mediaReportThread, nullptr, &thread) != KERN_SUCCESS) {
-      panic ("NATIVE_UFS media report: cannot start the report thread");
+      lqPanic ("NATIVE_UFS media report: cannot start the report thread");
     }
     thread_deallocate (thread);
     return true;
