@@ -3178,7 +3178,8 @@ static void captureRegistryWalk (IOService *service)
     if (driver) drivers++;
     if (media) medias++;
     if (!strncmp (name, "IOMediaBSD", 10)) clients++;
-    if ((device || driver || media) || strstr (name, "Storage") || strstr (name, "Block")) {
+    if ((device || driver || media) || contains (name, __builtin_strlen (name), "Storage") ||
+        contains (name, __builtin_strlen (name), "Block")) {
       if (interestingUsed < int (sizeof interesting) - 33) {
         interestingUsed += snprintf (interesting + interestingUsed, sizeof interesting - interestingUsed, "%s,", name);
       }
@@ -3189,7 +3190,7 @@ static void captureRegistryWalk (IOService *service)
   static const char *const kProbe[] = { "IOBlockStorageDevice", "IOBlockStorageDriver", "IOMedia" };
   unsigned registered[3] = { 0, 0, 0 };
   for (unsigned i = 0; i < sizeof (kProbe) / sizeof (kProbe[0]); ++i) {
-    OSSymbol *symbol = OSSymbol::withCString (kProbe[i]);
+    const OSSymbol *symbol = OSSymbol::withCString (kProbe[i]);
     if (!symbol) continue;
     registered[i] = OSMetaClass::getMetaClassWithName (symbol) ? 1u : 0u;
     symbol->release ();
