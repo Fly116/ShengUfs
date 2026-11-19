@@ -122,6 +122,11 @@ public:
 extern "C" void liuqin_milestone (const char *, const char *);   // liuqin console observation
 extern "C" void liuqin_debug_puts (const char *);
 
+// liuqin v51: armed by the ufshc nub match in probe(), read by the root publisher, which waits for
+// it before publishing block devices (matching is only usable after that match). The storage has
+// to live above probe(), so it is defined here instead of next to the publisher.
+static volatile int gLatePublishGate = 0;
+
 // liuqin bring-up (H11): on this board panic() text never reaches the screen — the KDB
 // wait is silent. Every panic in this file first dumps its report to the milestone
 // console, then calls the real panic so boot still halts. The helper is defined above
@@ -3098,7 +3103,7 @@ static volatile unsigned gStartRootEntries = 0;
 // liuqin v51: the windows must be published *after* IOKit matching works. The early root-device
 // start happens before bsd_init; the ufshc nub match ("probe-nub") happens after it. The
 // publisher waits for that second match before creating the block devices.
-static volatile int gLatePublishGate = 0;
+/* gLatePublishGate is defined above NativeUfs::probe, which arms it. */
 static volatile uintptr_t gFirstStartRootObject = 0;
 
 static void captureChainProbe (IOService *device, IOService *provider)
@@ -3267,7 +3272,7 @@ static void publishThread (void *, wait_result_t)
           if ((spin & 0xffff) == 0) thread_yield_to_preemption ();
           __asm__ __volatile__ ("yield" ::: "memory");
         }
-        liuqin_milestone (__atomic_load_n (&gLatePublishGate, __ATOMIC_ACQUIRE) ? "late-gate-open" : "late-gate-timeout");
+        liuqin_milestone ("U", __atomic_load_n (&gLatePublishGate, __ATOMIC_ACQUIRE) ? "late-gate-open" : "late-gate-timeout");
       }
       if (!device->start (gPendingStartProvider ? gPendingStartProvider : gPendingProvider)) {
         liuqin_milestone ("U", "root-winstart-fail");
