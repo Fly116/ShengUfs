@@ -2325,8 +2325,12 @@ volatile uint64_t native_ufs_block_reads = 0;
 volatile uint64_t native_ufs_block_failures = 0;
 }
 
-static char gRootDiagnosticText[2500];
+static char gRootDiagnosticText[3800];
 static char gRootMediaText[1000];
+// liuqin v57: the panel drops and reorders lines before a photograph can catch them, so the
+// registry walk that says whether an IOBlockStorageDriver ever claimed the window travels inside
+// the panic block instead. captureRegistryWalk() fills this; rootDiagnosticFailure() appends it.
+static char gRootRegistryText[1100];
 // Passive diagnostic reader: cached software values only. It must remain safe
 // when called from an IRQ while the transport is busy: no locks, allocations,
 // MMIO reads, queue resets, or changes to the command/trust state. Fields can
@@ -2350,6 +2354,7 @@ static void rootDiagnosticFailure (const char *reason)
   gRootDiagnostic.failures = native_ufs_block_failures;
   formatUfsRootDiagnostics (gRootDiagnosticText, sizeof (gRootDiagnosticText), gRootDiagnostic, reason);
   strlcat (gRootDiagnosticText, gRootMediaText, sizeof (gRootDiagnosticText));
+  strlcat (gRootDiagnosticText, gRootRegistryText, sizeof (gRootDiagnosticText));
   lqPanic ("%s", gRootDiagnosticText);
 }
 
@@ -3133,37 +3138,92 @@ static void captureObjectProbe (IOService *device)
   liuqin_debug_puts (text);
 }
 
-// liuqin v52: getMatchingServices() returns nothing here even for classes that do have
-// instances, so walk the registry itself. This prints what is actually published below the
-// platform expert: without an IOBlockStorageDriver entry the storage family never claimed the
-// window, and without an IOMedia entry there is nothing for the BSD client to attach to.
+// liuqin v57: getMatchingServices() returns nothing here even for classes that do have live
+// instances, so ask the registry itself and put the answer where it cannot be lost. Three
+// questions in one shot:
+//   - is the class registered at all? (metaclass lookup: a loaded kext registers its classes, so
+//     mc=010 means IOStorageFamily is missing while mc=111 means it is loaded and matching simply
+//     never produced a driver)
+//   - did anything below the platform expert end up as IOBlockStorageDriver / IOMedia?
+//   - what did the window itself reach, and what is published directly under the platform expert
+//     (IOResources shows up there once the kernel's own resources nub exists)
 static void captureRegistryWalk (IOService *service)
 {
   IOService *platform = IOService::getPlatform ();
   IORegistryEntry *from = platform ? static_cast<IORegistryEntry *> (platform) : nullptr;
+  unsigned total = 0, devices = 0, drivers = 0, medias = 0, clients = 0;
+  char interesting[300];
+  int interestingUsed = 0;
   IORegistryIterator *iterator = from ? IORegistryIterator::iterateOver (from, gIOServicePlane, kIORegistryIterateRecursively) : nullptr;
-  unsigned total = 0, shown = 0;
-  char text[300];
-  int used = 0;
 
-  used += snprintf (text, sizeof text, "PLANEWALK from=%s:", platform ? platform->getName () : "none");
-  while (iterator && shown < 6) {
+  interesting[0] = '\0';
+  while (iterator) {
     IORegistryEntry *entry = iterator->getNextObject ();
     if (!entry) break;
-    total++;
+    if (++total > 4000) break;                 // bounded: the service plane keeps growing
     IOService *candidate = OSDynamicCast (IOService, entry);
     if (!candidate) continue;
-    const char *name = candidate->getMetaClass ()->getClassName ();
+    const OSMetaClass *meta = candidate->getMetaClass ();
+    const char *name = meta ? meta->getClassName () : nullptr;
     if (!name) continue;
-    used += snprintf (text + used, sizeof (text) - used, " %s", name);
-    shown++;
+    const bool device = !strcmp (name, "IOBlockStorageDevice");
+    const bool driver = !strcmp (name, "IOBlockStorageDriver");
+    const bool media = !strcmp (name, "IOMedia");
+    if (device) devices++;
+    if (driver) drivers++;
+    if (media) medias++;
+    if (!strncmp (name, "IOMediaBSD", 10)) clients++;
+    if ((device || driver || media) || strstr (name, "Storage") || strstr (name, "Block")) {
+      if (interestingUsed < int (sizeof interesting) - 33) {
+        interestingUsed += snprintf (interesting + interestingUsed, sizeof interesting - interestingUsed, "%s,", name);
+      }
+    }
   }
   OSSafeReleaseNULL (iterator);
-  snprintf (text + used, sizeof (text) - used, " (total=%u)", total);
-  liuqin_debug_puts (text);
-  liuqin_debug_puts ("\n");
-}
 
+  static const char *const kProbe[] = { "IOBlockStorageDevice", "IOBlockStorageDriver", "IOMedia" };
+  unsigned registered[3] = { 0, 0, 0 };
+  for (unsigned i = 0; i < sizeof (kProbe) / sizeof (kProbe[0]); ++i) {
+    OSSymbol *symbol = OSSymbol::withCString (kProbe[i]);
+    if (!symbol) continue;
+    registered[i] = OSMetaClass::getMetaClassWithName (symbol) ? 1u : 0u;
+    symbol->release ();
+  }
+
+  // What sits directly under the platform expert in the service plane: this is the set a matching
+  // pass started at the root would see.
+  char direct[220];
+  int directUsed = 0;
+  IORegistryIterator *children = from ? IORegistryIterator::iterateOver (from, gIOServicePlane) : nullptr;
+  direct[0] = '\0';
+  while (children && directUsed < int (sizeof direct) - 33) {
+    IORegistryEntry *entry = children->getNextObject ();
+    if (!entry) break;
+    IOService *candidate = OSDynamicCast (IOService, entry);
+    const OSMetaClass *meta = candidate ? candidate->getMetaClass () : nullptr;
+    const char *name = meta ? meta->getClassName () : nullptr;
+    if (!name) continue;
+    directUsed += snprintf (direct + directUsed, sizeof direct - directUsed, "%s,", name);
+  }
+  OSSafeReleaseNULL (children);
+
+  const unsigned state = service ? static_cast<unsigned> (service->getState ()) : 0u;
+  snprintf (gRootRegistryText, sizeof (gRootRegistryText),
+            "REGWALK from=%.20s n=%u dev=%u drv=%u media=%u bsd=%u mc=%u%u%u\n"
+            "REGWALK direct: %s\n"
+            "REGWALK cls: %s\n"
+            "WIN %s state=0x%x matched=%u busy=%u\n"
+            "V57 dev=%u drv=%u media=%u mc=%u%u%u n=%u\n",
+            platform ? platform->getName () : "none", total, devices, drivers, medias, clients,
+            registered[0], registered[1], registered[2],
+            direct, interesting,
+            service ? service->getMetaClass ()->getClassName () : "none",
+            state, (state & kIOServiceMatchedState) ? 1u : 0u,
+            service ? service->getBusyState () : 0u,
+            devices, drivers, medias, registered[0], registered[1], registered[2], total);
+
+  liuqin_debug_puts (gRootRegistryText);   // panel copy as well: cheap, occasionally legible
+}
 static void capturePlaneCounts (const char *when)
 {
   // Printed through the panel writer (not lqPanic) so it never halts the boot: the
