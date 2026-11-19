@@ -2762,6 +2762,9 @@ extern "C" int native_ufs_block_authenticates (IOService *provider, const char *
 }
 #endif
 
+// Defined next to the registry walk, far below: start() reports its own result through it.
+static void captureRegistryDigest (const char *when, IOService *window);
+
 bool NativeUfsBlock::start (IOService *provider)
 {
   if (!bounceFree || !windowLock || !IOBlockStorageDevice::start (provider)) {
@@ -2777,10 +2780,20 @@ bool NativeUfsBlock::start (IOService *provider)
   OSSafeReleaseNULL (medium);
   OSSafeReleaseNULL (characteristics);
   online = true;
-  registerService ();
+  // liuqin v59: the registration must be synchronous.
+  //
+  // v58 measured the async path end to end: registerService() -> startMatching(0) queues an
+  // _IOServiceJob, bumps the busy count and returns immediately; the job is supposed to be picked
+  // up by an _IOConfigThread that startJob() creates on the spot with kernel_thread_start(). On
+  // this board that thread never ran: st stayed 0x0 and busy stayed 1 from before the media wait
+  // to the timeout, i.e. doServiceMatch() was never entered and no driver was ever offered the
+  // device. kIOServiceSynchronous makes doServiceMatch() run right here instead.
+  liuqin_milestone ("U", "sync-match-enter");
+  registerService (kIOServiceSynchronous);
   liuqin_milestone ("U", "blk-registered");
   startMatching ();
   liuqin_milestone ("U", "blk-matched");
+  captureRegistryDigest ("sync", this);
   return true;
 }
 
@@ -3010,33 +3023,38 @@ static bool mediaWithUuidExists (const char *uuid, NativeUfsBlock *window)
   return found;
 }
 
-// liuqin (H13) unauthenticated mode: no signed volume UUID to wait for, so the gate
-// relaxes to "any IOMedia whose service-plane ancestors reach this window" (the generic
-// IOBlockStorageDriver personality claimed the device and published its media).
+// liuqin (H13) unauthenticated mode: no signed volume UUID to wait for, so the gate relaxes to
+// "any IOMedia whose service-plane ancestors reach this window".
+//
+// liuqin v59: enumerate by walking, not by getMatchingServices(). That call selects on the
+// matched bit, and an IOMedia registers itself asynchronously from inside
+// IOBlockStorageDriver::handleStart() — so on a board where the async config thread does not run
+// (see the note in start()), the matching-based enumeration can never see the media that does
+// exist. Walk the plane and test ancestry for every IOMedia instance instead.
 static bool mediaUnderWindowExists (NativeUfsBlock *window)
 {
-  OSDictionary *matching = IOService::serviceMatching ("IOMedia");
+  IOService *platform = IOService::getPlatform ();
+  IORegistryEntry *from = platform ? static_cast<IORegistryEntry *> (platform) : nullptr;
+  IORegistryIterator *all = from ? IORegistryIterator::iterateOver (from, gIOServicePlane, kIORegistryIterateRecursively) : nullptr;
   bool found = false;
-  if (matching) {
-    OSIterator *iterator = IOService::getMatchingServices (matching);
-    if (iterator) {
-      for (unsigned matches = 0; matches < 64 && !found; ++matches) {
-        IORegistryEntry *media = OSDynamicCast (IORegistryEntry, iterator->getNextObject ());
-        if (!media) break;
-        IORegistryIterator *parents = IORegistryIterator::iterateOver (
-          media, gIOServicePlane, kIORegistryIterateRecursively | kIORegistryIterateParents);
-        if (parents) {
-          found = ufsMediaHasAncestor (*parents, window);
-          parents->release ();
-        }
-      }
-      iterator->release ();
+  unsigned seen = 0;
+
+  while (all && !found) {
+    if (++seen > 4000) break;                  // bounded: never spin on a growing plane
+    IORegistryEntry *entry = all->getNextObject ();
+    if (!entry) break;
+    IOService *service = OSDynamicCast (IOService, entry);
+    if (!service || !service->metaCast ("IOMedia")) continue;
+    IORegistryIterator *parents = IORegistryIterator::iterateOver (
+      entry, gIOServicePlane, kIORegistryIterateRecursively | kIORegistryIterateParents);
+    if (parents) {
+      found = ufsMediaHasAncestor (*parents, window);
+      parents->release ();
     }
-    OSSafeReleaseNULL (matching);
   }
+  OSSafeReleaseNULL (all);
   return found;
 }
-
 // What sits below the window in the service plane, matched or not (getMatchingServices lists only services whose matching has
 // finished, so media held up in matching would not show): each entry's class, BSD name, busy count and whether its matching is done.
 static void captureMissingMedia (const char *uuid, IOService *window)
@@ -3184,7 +3202,9 @@ static void captureRegistryDigest (const char *when, IOService *window)
     const OSMetaClass *meta = candidate->getMetaClass ();
     const char *name = meta ? meta->getClassName () : nullptr;
     if (!name) continue;
-    if (!strcmp (name, "IOBlockStorageDevice")) devices++;
+    // Our concrete class is NativeUfsBlock, so an exact-name test can never count it: ask the
+    // metaclass chain the way IOKit's own matching does.
+    if (candidate->metaCast ("IOBlockStorageDevice")) devices++;
     else if (!strcmp (name, "IOBlockStorageDriver")) drivers++;
     else if (!strcmp (name, "IOMedia")) medias++;
     else if (!strncmp (name, "IOMediaBSD", 10)) clients++;
