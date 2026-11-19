@@ -2336,6 +2336,9 @@ static char gRootMediaText[1000];
 // registry walk that says whether an IOBlockStorageDriver ever claimed the window travels inside
 // the panic block instead. captureRegistryWalk() fills this; rootDiagnosticFailure() appends it.
 static char gRootRegistryText[1100];
+// liuqin v58: the detailed walk is unreadable on this panel (two overlapping text layers), so the
+// answer also goes out as one short line, appended as the very last lines of the panic text.
+static char gRootDigestText[420];
 // Passive diagnostic reader: cached software values only. It must remain safe
 // when called from an IRQ while the transport is busy: no locks, allocations,
 // MMIO reads, queue resets, or changes to the command/trust state. Fields can
@@ -2360,6 +2363,8 @@ static void rootDiagnosticFailure (const char *reason)
   formatUfsRootDiagnostics (gRootDiagnosticText, sizeof (gRootDiagnosticText), gRootDiagnostic, reason);
   strlcat (gRootDiagnosticText, gRootMediaText, sizeof (gRootDiagnosticText));
   strlcat (gRootDiagnosticText, gRootRegistryText, sizeof (gRootDiagnosticText));
+  strlcat (gRootDiagnosticText, gRootDigestText, sizeof (gRootDiagnosticText));
+  liuqin_debug_puts (gRootDigestText);   // second chance on the panel before the halt
   lqPanic ("%s", gRootDiagnosticText);
 }
 
@@ -3152,6 +3157,65 @@ static void captureObjectProbe (IOService *device)
 //   - did anything below the platform expert end up as IOBlockStorageDriver / IOMedia?
 //   - what did the window itself reach, and what is published directly under the platform expert
 //     (IOResources shows up there once the kernel's own resources nub exists)
+// liuqin v58: one short line that survives a photograph.
+//
+//   st    IOBlockStorageDevice state: 0x0 = doServiceMatch never ran, 0x2 = ran but did not finish,
+//         0x6 = ran to the end. The matched bit means "this matching pass was processed", NOT
+//         "something claimed me", so it cannot be used as evidence of a driver either way.
+//   dev/drv/med/bsd  instances found by walking the service plane. Deliberately not
+//         getMatchingServices(): that one filters on the matched bit and hides exactly the
+//         objects whose matching has not completed.
+//   mc    whether the three classes are registered metaclasses at all (a loaded IOStorageFamily
+//         registers all three, so mc=111 means the family is there).
+//   dt    the device-type property the IOBlockStorageDriver personality matches on.
+static void captureRegistryDigest (const char *when, IOService *window)
+{
+  IOService *platform = IOService::getPlatform ();
+  IORegistryEntry *from = platform ? static_cast<IORegistryEntry *> (platform) : nullptr;
+  IORegistryIterator *iterator = from ? IORegistryIterator::iterateOver (from, gIOServicePlane, kIORegistryIterateRecursively) : nullptr;
+  unsigned total = 0, devices = 0, drivers = 0, medias = 0, clients = 0;
+
+  while (iterator) {
+    IORegistryEntry *entry = iterator->getNextObject ();
+    if (!entry) break;
+    if (++total > 4000) break;                 // bounded: the service plane keeps growing
+    IOService *candidate = OSDynamicCast (IOService, entry);
+    if (!candidate) continue;
+    const OSMetaClass *meta = candidate->getMetaClass ();
+    const char *name = meta ? meta->getClassName () : nullptr;
+    if (!name) continue;
+    if (!strcmp (name, "IOBlockStorageDevice")) devices++;
+    else if (!strcmp (name, "IOBlockStorageDriver")) drivers++;
+    else if (!strcmp (name, "IOMedia")) medias++;
+    else if (!strncmp (name, "IOMediaBSD", 10)) clients++;
+  }
+  OSSafeReleaseNULL (iterator);
+
+  static const char *const kProbe[] = { "IOBlockStorageDevice", "IOBlockStorageDriver", "IOMedia" };
+  unsigned registered[3] = { 0, 0, 0 };
+  for (unsigned i = 0; i < sizeof (kProbe) / sizeof (kProbe[0]); ++i) {
+    const OSSymbol *symbol = OSSymbol::withCString (kProbe[i]);
+    if (!symbol) continue;
+    registered[i] = OSMetaClass::getMetaClassWithName (symbol) ? 1u : 0u;
+    symbol->release ();
+  }
+
+  const unsigned state = window ? static_cast<unsigned> (window->getState ()) : 0u;
+  OSObject *type = window ? window->copyProperty (kIOBlockStorageDeviceTypeKey) : nullptr;
+  OSString *typeText = OSDynamicCast (OSString, type);
+  char line[240];
+
+  snprintf (line, sizeof line,
+            "V58 %.4s st=0x%x busy=%u dev=%u drv=%u med=%u bsd=%u mc=%u%u%u n=%u dt=%.16s\n",
+            when, state, window ? window->getBusyState () : 0u,
+            devices, drivers, medias, clients,
+            registered[0], registered[1], registered[2], total,
+            typeText ? typeText->getCStringNoCopy () : "-");
+  OSSafeReleaseNULL (type);
+  strlcat (gRootDigestText, line, sizeof (gRootDigestText));
+  liuqin_debug_puts (line);   // panel copy as well: occasionally legible when nothing else is
+}
+
 static void captureRegistryWalk (IOService *service)
 {
   IOService *platform = IOService::getPlatform ();
@@ -3306,19 +3370,20 @@ static void publishThread (void *, wait_result_t)
       // the first iteration and the media never appeared. Spin instead, yield so the
       // IOKit matching thread can run and create the IOMedia, and poke the deferred
       // matches explicitly.
-      const unsigned kSpinPerTick = 4000000u;   // ~10-40 ms per pass; see the note above
-      for (unsigned tick = 0; tick <= 300; ++tick) {
+      const unsigned kSpinPerTick = 1000000u;   // liuqin v58: 4x shorter, so the panic is reachable while someone is still watching
+      for (unsigned tick = 0; tick <= 60; ++tick) {   // liuqin v58: was 300; the panic has to happen while a photo is still possible
         if (tick == 0) {
           // Counted once up front so the panel shows the plane even if the wait is long.
           captureObjectProbe (device);
           captureChainProbe (device, gPendingProvider);
           capturePlaneCounts ("start");
+          captureRegistryDigest ("pre", device);
         }
         if (tick == 0 || (tick % 100) == 0) {
           IOService::startDeferredMatches ();   // cheap; do not call startMatching here
         }
         ready = unauth ? mediaUnderWindowExists (device) : mediaWithUuidExists (uuid, device);
-        if (ready || tick == 300) break;
+        if (ready || tick == 60) break;
         if (tick && tick % 50 == 0) {
           captureMissingMedia (uuid, device);
           IOLog ("NativeUfs: %s volume %s still missing after %u passes, window busy %u\n%s", device->windowLabel (), shown,
@@ -3336,6 +3401,7 @@ static void publishThread (void *, wait_result_t)
         IOLog ("NativeUfs: media at timeout, window busy %u\n%s", device->getBusyState (), gRootMediaText);
         liuqin_milestone ("U", "root-media-timeout");
         capturePlaneCounts ("timeout");
+        captureRegistryDigest ("post", device);
         captureRegistryWalk (device);
       } else {
         static char marker[40];   // one publisher thread at a time
