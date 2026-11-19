@@ -4,13 +4,14 @@
 // ---- LUN 0 GPT and the root-image manifest -------------------------------------------------
 struct RootWindow {
   char name[32];
-  uint64_t offset;   // bytes from the start of the userdata partition
+  uint64_t offset;   // bytes from the start of the root partition
   uint64_t size;     // bytes
   uint8_t sha256[32];
 };
 
 struct RootLayout {
-  uint64_t userdataFirst, userdataLast;   // 4096-byte LBAs on LUN 0
+  uint64_t userdataFirst, userdataLast;   // 4096-byte LBAs on LUN 0; the root partition ("userdata" by default)
+  uint64_t rootBaseLba;                   // 4096-byte LBA the manifest is read from: userdataFirst + root offset/4096
   uint64_t imageBytes;                    // size of the flashed root image from the manifest (0 when none)
   uint64_t gptEntriesLba;                 // GPT facts recorded for the persistent store's before/after comparison
   uint32_t gptHeaderCrc, gptEntriesCrc, gptEntryCount;
@@ -56,8 +57,57 @@ static bool rootEntryUsed (const uint8_t *entry)
   return used != 0;
 }
 
-// Find the partition named "userdata" in LUN 0's primary GPT (4096-byte sectors), then read the
-// manifest at its first block. Read-only. Returns false only if the GPT itself is unusable.
+// The GPT partition that carries the SHNGROOT directory. NativeUfs::start() overrides it from
+// the native-ufs-root-partition boot argument before any probe or root start reaches
+// findRootLayout(); without that argument the driver keeps looking in "userdata", the board
+// default (all installed layouts used to live there).
+static char gRootPartition[32] = "userdata";
+
+// Install a partition name for findRootLayout(). The value is compared against the GPT entry's
+// UTF-16LE name, so only printable ASCII that fits the 32-byte record is accepted. On refusal the
+// current name (the board default or an earlier accepted override) is kept and false is returned.
+static inline bool setRootPartition (const char *name)
+{
+  if (!name) {
+    return false;
+  }
+  size_t length = 0;
+  while (length < sizeof (gRootPartition) - 1 && name[length]) {
+    if (name[length] < 0x20 || name[length] > 0x7e) {
+      return false;
+    }
+    length++;
+  }
+  if (!length || name[length]) {
+    return false;
+  }
+  bzero (gRootPartition, sizeof (gRootPartition));
+  memcpy (gRootPartition, name, length);
+  return true;
+}
+
+// A root image may be placed at a byte offset inside the root partition (boot argument
+// native-ufs-root-offset, typically the tail left after shrinking the Android f2fs). Only a
+// 4096-byte aligned offset is meaningful: the manifest base LBA moves by offset/4096, while
+// userdataFirst/userdataLast stay the GPT entry's own bounds (reporting, and the store/log
+// windows anchored at the end of the partition).
+static uint64_t gRootOffsetBytes = 0;
+
+// Install the in-partition byte offset. The caller records it for findRootLayout(); only the
+// 4096-byte block alignment is checked here, and on refusal the previous value is kept.
+static inline bool setRootOffset (uint64_t bytes)
+{
+  if (bytes & 4095) {
+    return false;
+  }
+  gRootOffsetBytes = bytes;
+  return true;
+}
+
+// Find the root partition (gRootPartition: "userdata" unless native-ufs-root-partition named
+// another GPT entry) in LUN 0's primary GPT (4096-byte sectors), then read the manifest at the
+// partition's first block plus gRootOffsetBytes. Read-only. Returns false only if the GPT itself
+// is unusable.
 static bool findRootLayout (RootLayout *layout, const char **why)
 {
   gRootDiagnostic.stage = "GPT header";
@@ -105,7 +155,11 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     *why = "GPT entries CRC";
     return false;
   }
-  static const char wanted[] = "userdata";
+  const char *wanted = gRootPartition;
+  unsigned wantedLength = 0;
+  while (wanted[wantedLength]) {
+    wantedLength++;
+  }
   bool found = false;
   for (uint32_t index = 0; index < count; index++) {
     const uint8_t *entry = gScratch + index * 128;
@@ -123,15 +177,20 @@ static bool findRootLayout (RootLayout *layout, const char **why)
       }
     }
     bool match = true;
-    for (unsigned c = 0; c < sizeof (wanted); c++) {
+    for (unsigned c = 0; c < wantedLength; c++) {
       if (entry[56 + 2 * c] != static_cast<uint8_t> (wanted[c]) || entry[57 + 2 * c] != 0) {
         match = false;
         break;
       }
     }
+    // The GPT name is NUL terminated UTF-16LE: the character after the wanted name must be the
+    // empty one, otherwise "userdata" would also match a longer name such as "userdata2".
+    if (match && (entry[56 + 2 * wantedLength] || entry[57 + 2 * wantedLength])) {
+      match = false;
+    }
     if (match) {
       if (found) {
-        *why = "duplicate userdata partition";
+        *why = "duplicate root partition";
         return false;
       }
       layout->userdataFirst = le64 (entry + 32);
@@ -140,15 +199,21 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     }
   }
   if (!found || layout->userdataLast < layout->userdataFirst) {
-    *why = "no userdata partition";
+    *why = "no root partition";
+    return false;
+  }
+  layout->rootBaseLba = layout->userdataFirst + gRootOffsetBytes / 4096;
+  if (layout->rootBaseLba > layout->userdataLast) {
+    *why = "root offset outside the root partition";
     return false;
   }
   gRootDiagnostic.first = layout->userdataFirst;
   gRootDiagnostic.last = layout->userdataLast;
   gRootDiagnostic.stage = "root manifest";
-  // First block of the partition: manifest if the root image was flashed, ext4 otherwise.
-  if (hostRead4k (0, layout->userdataFirst, 1, gScratch) != kIOReturnSuccess) {
-    *why = "userdata first block read";
+  // The manifest block: the partition's first block for an in-place image, or the configured
+  // offset inside it for an image placed in the tail (rootBaseLba). Read-only either way.
+  if (hostRead4k (0, layout->rootBaseLba, 1, gScratch) != kIOReturnSuccess) {
+    *why = "root manifest block read";
     return false;
   }
   layout->magic0 = le32 (gScratch);
@@ -170,7 +235,8 @@ static bool findRootLayout (RootLayout *layout, const char **why)
       SHA256_Final (digest, &context);
       layout->manifestStatus = 3;
       if (memcmp (digest, gScratch + 4064, 32) == 0) {
-        uint64_t partitionBytes = (layout->userdataLast - layout->userdataFirst + 1) * 4096ULL;
+        // Bounds are measured from the manifest base, so an offset image cannot reach past the GPT end.
+        uint64_t partitionBytes = (layout->userdataLast + 1 - layout->rootBaseLba) * 4096ULL;
         layout->manifestStatus = 4;
         bool bounds = imageBytes >= 4096 && !(imageBytes & 4095) && imageBytes <= partitionBytes;
         for (uint32_t index = 0; index < n && bounds; index++) {

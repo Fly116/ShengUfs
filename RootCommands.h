@@ -251,7 +251,9 @@ static IOReturn hostNop (void)
   if (!hostClearUcd (slot)) return kIOReturnNotReady;
   slot.ucd[3] = 1;
   uint32_t ocs = 15;
+  liuqin_milestone ("U", "h:nop-wait");
   IOReturn result = hostSubmit (slot, 0, 0, 200000, &ocs);
+  liuqin_milestone ("U", (result == kIOReturnSuccess) ? "h:nop-ok" : "h:nop-fail");
   if (result != kIOReturnSuccess) return result;
   result = hostResponseHeader (slot, 0x20, 0, 1);
   if (result != kIOReturnSuccess) return result;

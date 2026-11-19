@@ -6,6 +6,9 @@ struct UfsTransferPoll {
   uint32_t polls = 0, doorbellSeen = 0, interruptSeen = 0, ocs = 15;
 };
 static constexpr uint32_t kUfsFatalStatus = 0x71880U;
+// liuqin: bring-up runs before the timer is reliable, so a deadline-based
+// loop can spin forever (mach_absolute_time() stays put). Bound it.
+static constexpr uint32_t kUfsMaxPolls = 20000U;
 
 template <class Port>
 static UfsTransferEnd pollUfsTransfer(Port &port, UfsTransferPoll &state)
@@ -22,7 +25,7 @@ static UfsTransferEnd pollUfsTransfer(Port &port, UfsTransferPoll &state)
       // Also allow a completion so fast that software never observes DB=1.
       if (state.ocs != 15) return UfsTransferEnd::Completed;
     }
-    if (port.expired()) return UfsTransferEnd::Timeout;
+    if ((state.polls >= kUfsMaxPolls) || port.expired()) return UfsTransferEnd::Timeout;
     port.delay();
   }
 }
