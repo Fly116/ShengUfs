@@ -121,6 +121,11 @@ public:
 
 extern "C" void liuqin_milestone (const char *, const char *);   // liuqin console observation
 extern "C" void liuqin_debug_puts (const char *);
+// osfmk/kern/thread.c: one line per waiting thread, into a caller buffer so it travels in the panic text.
+extern "C" void liuqin_dump_waiting_threads (char *out, size_t size);
+// iokit/Kernel/IOService.cpp: the IOKit configuration-thread accounting.
+extern "C" unsigned liuqin_iokit_job_counts (unsigned *outstanding, unsigned *configThreads,
+    unsigned *waitingThreads, unsigned *maxConfigThreads);
 
 // liuqin v51: armed by the ufshc nub match in probe(), read by the root publisher, which waits for
 // it before publishing block devices (matching is only usable after that match). The storage has
@@ -2330,7 +2335,7 @@ volatile uint64_t native_ufs_block_reads = 0;
 volatile uint64_t native_ufs_block_failures = 0;
 }
 
-static char gRootDiagnosticText[3800];
+static char gRootDiagnosticText[6800];
 static char gRootMediaText[1000];
 // liuqin v57: the panel drops and reorders lines before a photograph can catch them, so the
 // registry walk that says whether an IOBlockStorageDriver ever claimed the window travels inside
@@ -2339,6 +2344,9 @@ static char gRootRegistryText[1100];
 // liuqin v58: the detailed walk is unreadable on this panel (two overlapping text layers), so the
 // answer also goes out as one short line, appended as the very last lines of the panic text.
 static char gRootDigestText[420];
+// liuqin v60: the IOKit job accounting and the waiting-thread dump, both appended to the panic text.
+static char gJobText[160];
+static char gWaiterText[1600];
 // Passive diagnostic reader: cached software values only. It must remain safe
 // when called from an IRQ while the transport is busy: no locks, allocations,
 // MMIO reads, queue resets, or changes to the command/trust state. Fields can
@@ -2363,6 +2371,8 @@ static void rootDiagnosticFailure (const char *reason)
   formatUfsRootDiagnostics (gRootDiagnosticText, sizeof (gRootDiagnosticText), gRootDiagnostic, reason);
   strlcat (gRootDiagnosticText, gRootMediaText, sizeof (gRootDiagnosticText));
   strlcat (gRootDiagnosticText, gRootRegistryText, sizeof (gRootDiagnosticText));
+  strlcat (gRootDiagnosticText, gJobText, sizeof (gRootDiagnosticText));
+  strlcat (gRootDiagnosticText, gWaiterText, sizeof (gRootDiagnosticText));
   strlcat (gRootDiagnosticText, gRootDigestText, sizeof (gRootDiagnosticText));
   liuqin_debug_puts (gRootDigestText);   // second chance on the panel before the halt
   lqPanic ("%s", gRootDiagnosticText);
@@ -3423,6 +3433,19 @@ static void publishThread (void *, wait_result_t)
         capturePlaneCounts ("timeout");
         captureRegistryDigest ("post", device);
         captureRegistryWalk (device);
+        // liuqin v60: is there a configuration thread at all, and if the job is stuck, which thread
+        // is it stuck in? "queued but never picked up" and "picked up and blocked" look identical
+        // from the outside, so print both halves here.
+        {
+          unsigned outstanding = 0, configThreads = 0, waitingThreads = 0, maxConfigThreads = 0;
+          unsigned cpus = liuqin_iokit_job_counts (&outstanding, &configThreads, &waitingThreads,
+                                                   &maxConfigThreads);
+          snprintf (gJobText, sizeof gJobText, "JOBS out=%u cfg=%u wait=%u max=%u cpus=%u\n",
+                    outstanding, configThreads, waitingThreads, maxConfigThreads, cpus);
+          liuqin_debug_puts (gJobText);
+        }
+        liuqin_dump_waiting_threads (gWaiterText, sizeof gWaiterText);
+        liuqin_debug_puts (gWaiterText);
       } else {
         static char marker[40];   // one publisher thread at a time
         snprintf (marker, sizeof marker, "root-media-%.8s", device->windowLabel ());
